@@ -7,7 +7,7 @@ from utility.log import Log
 from utility.initialize import initialize
 from utility.step_lr import StepLR
 from utility.bypass_bn import enable_running_stats, disable_running_stats
-from tools.metric import MomentHubs
+from tools.metric import MomentHubs, GrokkingIndexMeter, gi_decision
 from data.cifarn import Cifar100, Cifar10
 from utility.noise import noisify_with_P, noisify_cifar10_asymmetric, \
     noisify_cifar100_asymmetric, noisify_mnist_asymmetric, noisify_pairflip, noisify_modelnet40_asymmetric
@@ -167,6 +167,12 @@ if __name__ == "__main__":
     parser.add_argument("--train_val_ratio", default=1.0, type=float, help="train_val_ratio to split dataset.")
     parser.add_argument("--checkpoint", default=None, type=str, help="checkpoint name")
     parser.add_argument('--num_classes', default=100, type=int, help='number of classes ')
+    parser.add_argument("--gi_eval_interval", default=10, type=int, help="Epoch interval for GI evaluation.")
+    parser.add_argument("--gi_eval_batches", default=1, type=int, help="How many train/val batches are used for GI evaluation.")
+    parser.add_argument("--gi_lambda", default=0.05, type=float, help="Lambda for adaptive local perturbation radius in GI.")
+    parser.add_argument("--gi_dataset_threshold", default=0.8, type=float, help="Dataset-layer threshold for GI decision.")
+    parser.add_argument("--gi_model_threshold", default=0.7, type=float, help="Model-layer threshold for GI decision.")
+    parser.add_argument("--gi_hyper_threshold", default=0.6, type=float, help="Hyperparameter-layer threshold for GI decision.")
     args = parser.parse_args()
 
     initialize(args, seed=42)
@@ -226,6 +232,7 @@ if __name__ == "__main__":
 
     train_recoder = MomentHubs()
     val_recoder = MomentHubs()
+    gi_meter = GrokkingIndexMeter(max_models=6, alpha_steps=11)
 
     for epoch in range(args.epochs):
         model.train()
@@ -289,6 +296,45 @@ if __name__ == "__main__":
                 }
                 torch.save(state, './checkpoint/{}/{}/{}.pth'.format(args.arch,args.dataset,args.exp_name))
                 best_acc = acc
+        train_loss_mean = train_recoder.get("loss_ce").items
+        train_loss_mean = float(sum(train_loss_mean) / max(len(train_loss_mean), 1))
+        gi_meter.update_model_pool(model, train_loss=train_loss_mean)
+
+        if ((epoch + 1) % args.gi_eval_interval == 0) or (epoch == args.epochs - 1):
+            gi_scores = gi_meter.compute(
+                model=model,
+                model_builder=lambda: get_model(args),
+                train_loader=dataset.train,
+                val_loader=dataset.test,
+                criterion=lambda outputs, targets: smooth_crossentropy(outputs, targets, smoothing=args.label_smoothing),
+                device=device,
+                lambda_loc=args.gi_lambda,
+                max_batches=args.gi_eval_batches,
+                fallback_train_loss=train_loss_mean,
+            )
+            decision = gi_decision(
+                gi=gi_scores["gi"],
+                dataset_thr=args.gi_dataset_threshold,
+                model_thr=args.gi_model_threshold,
+                hyper_thr=args.gi_hyper_threshold,
+            )
+            print(
+                "[GI] epoch={} gi={:.6f} s_loc={:.6f} s_int={:.6f} s_glob={:.6f} -> {}: {}".format(
+                    epoch + 1,
+                    gi_scores["gi"],
+                    gi_scores["s_loc"],
+                    gi_scores["s_int"],
+                    gi_scores["s_glob"],
+                    decision["level"],
+                    decision["action"],
+                )
+            )
+            train_recoder.append_direct_to_recoder("GI", gi_scores["gi"])
+            train_recoder.append_direct_to_recoder("GI_S_loc", gi_scores["s_loc"])
+            train_recoder.append_direct_to_recoder("GI_S_int", gi_scores["s_int"])
+            train_recoder.append_direct_to_recoder("GI_S_glob", gi_scores["s_glob"])
+            train_recoder.append_direct_to_recoder("GI_decision_level", decision["level"])
+
         train_recoder.step_summary()
         val_recoder.step_summary()
 
