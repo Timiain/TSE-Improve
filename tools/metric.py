@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -179,6 +180,164 @@ class SegCrossEntropyLoss(nn.Module):
         B, H, W = targets.size()
         inputs = F.interpolate(inputs, (H, W), mode='bilinear', align_corners=True)
         return self.task_loss(inputs, targets)
+
+
+class GrokkingIndexMeter(object):
+    """
+    GI (Grokking-Index) estimator:
+      GI = min(S_loc, S_int, S_glob) + mean(S_loc, S_int, S_glob)
+
+    组件定义：
+      - S_loc: 局部扰动敏感度（权重扰动后训练损失增量）
+      - S_int: 插值路径壁垒（插值模型上的 val-train 最大差）
+      - S_glob: 模型池最坏训练损失
+    """
+
+    def __init__(self, max_models=6, alpha_steps=11):
+        self.max_models = max_models
+        self.alpha_steps = alpha_steps
+        self.model_pool = []
+
+    def _clone_state_dict(self, model):
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    def update_model_pool(self, model, train_loss=None):
+        self.model_pool.append(
+            {
+                "state_dict": self._clone_state_dict(model),
+                "train_loss": None if train_loss is None else float(train_loss),
+            }
+        )
+        if len(self.model_pool) > self.max_models:
+            self.model_pool.pop(0)
+
+    @staticmethod
+    def _iterate_batches(data_loader, max_batches):
+        for idx, batch in enumerate(data_loader):
+            if idx >= max_batches:
+                break
+            if len(batch) >= 2:
+                yield batch[0], batch[1]
+
+    def _average_loss(self, model, data_loader, criterion, device, max_batches=1):
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for inputs, targets in self._iterate_batches(data_loader, max_batches):
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                outputs = model(inputs)
+                losses.append(float(criterion(outputs, targets).mean().item()))
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _local_sensitivity(self, model, train_loader, criterion, device, lambda_loc=0.05, max_batches=1):
+        model.train()
+        losses = []
+        for inputs, targets in self._iterate_batches(train_loader, max_batches):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            model.zero_grad(set_to_none=True)
+            base_loss = criterion(model(inputs), targets).mean()
+            base_loss.backward()
+
+            grad_norm_sq = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_norm_sq += float(torch.sum(p.grad.detach() ** 2).item())
+            grad_norm = np.sqrt(grad_norm_sq) + 1e-12
+            rho = lambda_loc * grad_norm
+
+            perturbations = []
+            with torch.no_grad():
+                for p in model.parameters():
+                    if p.grad is None:
+                        perturbations.append(None)
+                        continue
+                    eps = p.grad / (p.grad.norm(p=2) + 1e-12) * rho
+                    p.add_(eps)
+                    perturbations.append(eps)
+
+            with torch.no_grad():
+                perturbed_loss = criterion(model(inputs), targets).mean()
+            losses.append(float((perturbed_loss - base_loss.detach()).item()))
+
+            with torch.no_grad():
+                for p, eps in zip(model.parameters(), perturbations):
+                    if eps is not None:
+                        p.sub_(eps)
+
+            model.zero_grad(set_to_none=True)
+
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _interpolation_barrier(self, current_model, model_builder, train_loader, val_loader, criterion, device, max_batches=1):
+        if not self.model_pool:
+            return 0.0
+
+        other_state = self.model_pool[np.random.randint(len(self.model_pool))]["state_dict"]
+        current_state = self._clone_state_dict(current_model)
+
+        interp_model = model_builder()
+        interp_model.to(device)
+        interp_model.eval()
+
+        barrier = -float("inf")
+        alphas = np.linspace(0.0, 1.0, num=self.alpha_steps)
+        for alpha in alphas:
+            mixed_state = {}
+            for name in current_state:
+                w_cur = current_state[name].to(device)
+                w_old = other_state[name].to(device)
+                mixed_state[name] = ((1.0 - alpha) * w_cur + alpha * w_old).to(w_cur.dtype)
+
+            interp_model.load_state_dict(mixed_state, strict=True)
+            train_loss = self._average_loss(interp_model, train_loader, criterion, device, max_batches=max_batches)
+            val_loss = self._average_loss(interp_model, val_loader, criterion, device, max_batches=max_batches)
+            barrier = max(barrier, val_loss - train_loss)
+
+        return float(max(barrier, 0.0))
+
+    def _global_worst_case(self, fallback_train_loss):
+        train_losses = [item["train_loss"] for item in self.model_pool if item["train_loss"] is not None]
+        if fallback_train_loss is not None:
+            train_losses.append(float(fallback_train_loss))
+        return float(max(train_losses)) if train_losses else 0.0
+
+    def compute(self, model, model_builder, train_loader, val_loader, criterion, device, lambda_loc=0.05, max_batches=1, fallback_train_loss=None):
+        s_loc = self._local_sensitivity(model, train_loader, criterion, device, lambda_loc=lambda_loc, max_batches=max_batches)
+        s_int = self._interpolation_barrier(model, model_builder, train_loader, val_loader, criterion, device, max_batches=max_batches)
+        s_glob = self._global_worst_case(fallback_train_loss)
+        components = [s_loc, s_int, s_glob]
+        gi = float(np.min(components) + np.mean(components))
+        return {
+            "gi": gi,
+            "s_loc": float(s_loc),
+            "s_int": float(s_int),
+            "s_glob": float(s_glob),
+        }
+
+
+def gi_decision(gi, dataset_thr=0.8, model_thr=0.7, hyper_thr=0.6):
+    if gi > dataset_thr:
+        return {
+            "level": "dataset",
+            "action": "扩充/增强数据，或重采样修正分布偏差",
+        }
+    if gi > model_thr:
+        return {
+            "level": "model",
+            "action": "降低模型容量并增加正则（Dropout/LayerNorm）",
+        }
+    if gi > hyper_thr:
+        return {
+            "level": "hyper",
+            "action": "增大对抗强度并使用更平滑学习率调度",
+        }
+    return {
+        "level": "stable",
+        "action": "保持当前配置，继续训练或结束迭代",
+    }
 
 if __name__ == '__main__':
 
