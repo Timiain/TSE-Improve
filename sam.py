@@ -1,3 +1,5 @@
+from collections import deque
+
 import torch
 
 class SAM(torch.optim.Optimizer):
@@ -244,6 +246,230 @@ class FGASAM(torch.optim.Optimizer):
             p=2,
         )
         return norm
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.base_optimizer.param_groups = self.param_groups
+
+
+class CurvAdaptiveSAM(torch.optim.Optimizer):
+    """CURV-ADAPT: curvature-aware SAM with projected gradients and adaptive schedule."""
+
+    def __init__(
+        self,
+        params,
+        base_optimizer,
+        rho=0.05,
+        adaptive=False,
+        base_batch_size=128,
+        min_batch_size=32,
+        hessian_momentum=0.9,
+        gp_rank=32,
+        gp_window=20,
+        gp_update_interval=10,
+        gp_weight_temperature=5.0,
+        curvature_floor=1e-6,
+        **kwargs,
+    ):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        assert base_batch_size > 0, "base_batch_size should be positive"
+        assert min_batch_size > 0, "min_batch_size should be positive"
+        assert 0.0 <= hessian_momentum < 1.0, "hessian_momentum should be in [0, 1)"
+        assert gp_rank > 0, "gp_rank should be positive"
+        assert gp_window > 0, "gp_window should be positive"
+        assert gp_update_interval > 0, "gp_update_interval should be positive"
+
+        defaults = dict(
+            rho=rho,
+            adaptive=adaptive,
+            base_batch_size=base_batch_size,
+            min_batch_size=min_batch_size,
+            hessian_momentum=hessian_momentum,
+            gp_rank=gp_rank,
+            gp_window=gp_window,
+            gp_update_interval=gp_update_interval,
+            gp_weight_temperature=gp_weight_temperature,
+            curvature_floor=curvature_floor,
+            **kwargs,
+        )
+        super().__init__(params, defaults)
+
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+        self.defaults.update(self.base_optimizer.defaults)
+
+        for group in self.param_groups:
+            if "base_lr" not in group:
+                group["base_lr"] = group["lr"]
+
+        self.gp_feature_history = deque(maxlen=gp_window)
+        self.gp_loss_history = deque(maxlen=gp_window)
+        self.curvature_error_var = 0.0
+        self.global_step = 0
+
+        self.last_d_plus = 0
+        self.last_total_dim = 1
+        self.last_eta_scale = 1.0
+        self.last_sigma2 = 0.0
+        self.suggested_batch_size = base_batch_size
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        projected_norm, d_plus, total_dim, feature_vec = self._project_gradients(update_curvature=True)
+        self.last_d_plus = int(d_plus)
+        self.last_total_dim = int(max(total_dim, 1))
+
+        dim_ratio = d_plus / max(total_dim, 1)
+        sigma2 = float(self.curvature_error_var)
+        self.last_sigma2 = sigma2
+        self.last_eta_scale = dim_ratio / (1.0 + sigma2)
+
+        for group in self.param_groups:
+            group["lr"] = group["base_lr"] * self.last_eta_scale
+            scale = group["rho"] / (projected_norm + 1e-12)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                self.state[p]["old_p"] = p.data.clone()
+                perturb_grad = self.state[p]["projected_grad"]
+                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * perturb_grad * scale.to(p)
+                p.add_(e_w)
+
+            raw_batch = int(group["base_batch_size"] * dim_ratio)
+            group["suggested_batch_size"] = max(group["min_batch_size"], raw_batch)
+            self.suggested_batch_size = int(group["suggested_batch_size"])
+
+        feature = feature_vec.detach().cpu()
+        if feature.numel() > 0:
+            self.gp_feature_history.append(feature)
+
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.data = self.state[p]["old_p"]
+
+        _, _, _, feature_vec = self._project_gradients(update_curvature=True)
+        self.base_optimizer.step()
+        self.global_step += 1
+
+        feature = feature_vec.detach().cpu()
+        if feature.numel() > 0:
+            self.gp_feature_history.append(feature)
+
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        assert closure is not None, "CurvAdaptiveSAM requires closure, but it was not provided"
+        closure = torch.enable_grad()(closure)
+
+        self.first_step(zero_grad=True)
+        loss = closure()
+        self.second_step()
+        return loss
+
+    @torch.no_grad()
+    def update_surrogate(self, loss_value):
+        self.gp_loss_history.append(float(loss_value))
+        if self.global_step % self.param_groups[0]["gp_update_interval"] != 0:
+            return
+        if len(self.gp_feature_history) < 2 or len(self.gp_loss_history) < 2:
+            return
+
+        features = torch.stack(list(self.gp_feature_history))
+        losses = torch.tensor(list(self.gp_loss_history), dtype=features.dtype)
+
+        centered_loss = losses - losses.mean()
+        temp = max(self.param_groups[0]["gp_weight_temperature"], 1e-6)
+        weights = torch.softmax(-torch.abs(centered_loss) * temp, dim=0)
+
+        mean_feature = torch.sum(features * weights[:, None], dim=0)
+        diff = features - mean_feature
+        weighted_var = torch.sum((diff.pow(2).sum(dim=1)) * weights) / max(features.shape[1], 1)
+        self.curvature_error_var = float(weighted_var.item())
+
+    @torch.no_grad()
+    def _project_gradients(self, update_curvature=True):
+        projected_norm_terms = []
+        d_plus = 0
+        total_dim = 0
+        feature_chunks = []
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.detach()
+                flat_grad = grad.reshape(-1)
+                if flat_grad.numel() == 0:
+                    continue
+
+                state = self.state[p]
+                if "prev_grad" not in state:
+                    state["prev_grad"] = torch.zeros_like(flat_grad)
+                    state["h_diag_ema"] = torch.zeros_like(flat_grad)
+                    state["feature_idx"] = self._init_feature_index(flat_grad.numel(), group["gp_rank"], flat_grad.device)
+                    state["feature_sign"] = self._init_feature_sign(state["feature_idx"].numel(), flat_grad.device)
+
+                grad_delta = flat_grad - state["prev_grad"]
+                h_diag = state["h_diag_ema"] * group["hessian_momentum"] + (1.0 - group["hessian_momentum"]) * grad_delta.pow(2)
+                h_diag = torch.clamp(h_diag, min=group["curvature_floor"])
+                state["h_diag_ema"] = h_diag
+
+                threshold = h_diag.mean()
+                pos_mask = (h_diag >= threshold).to(flat_grad.dtype)
+                projected = flat_grad * pos_mask
+
+                residual = flat_grad - projected
+                residual_norm_sq = torch.dot(residual, residual)
+                if residual_norm_sq > 0:
+                    correction_scale = torch.dot(projected, residual) / (residual_norm_sq + 1e-12)
+                    projected = projected - correction_scale * residual
+
+                projected_view = projected.view_as(grad)
+                p.grad.copy_(projected_view)
+                state["projected_grad"] = projected_view.clone()
+                state["prev_grad"] = flat_grad.clone() if update_curvature else state["prev_grad"]
+
+                d_plus += int(pos_mask.sum().item())
+                total_dim += int(pos_mask.numel())
+                projected_norm_terms.append(projected_view.norm(p=2))
+
+                idx = state["feature_idx"]
+                sign = state["feature_sign"]
+                feature = flat_grad[idx] * sign
+                feature_chunks.append(feature)
+
+        if projected_norm_terms:
+            projected_norm = torch.norm(torch.stack(projected_norm_terms), p=2)
+        else:
+            param = self.param_groups[0]["params"][0]
+            projected_norm = torch.tensor(0.0, device=param.device)
+
+        if feature_chunks:
+            feature_vec = torch.cat(feature_chunks, dim=0)
+        else:
+            feature_vec = torch.tensor([], device=projected_norm.device)
+
+        return projected_norm, d_plus, total_dim, feature_vec
+
+    def _init_feature_index(self, n, rank, device):
+        size = min(n, rank)
+        if size == n:
+            return torch.arange(n, device=device, dtype=torch.long)
+        perm = torch.randperm(n, device=device)
+        return perm[:size]
+
+    def _init_feature_sign(self, n, device):
+        return torch.randint(0, 2, (n,), device=device, dtype=torch.long).float().mul_(2.0).sub_(1.0)
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
