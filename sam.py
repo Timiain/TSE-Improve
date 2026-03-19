@@ -474,3 +474,224 @@ class CurvAdaptiveSAM(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.base_optimizer.param_groups = self.param_groups
+
+
+class CAP(torch.optim.Optimizer):
+    """Curvature-Aware Adaptive Perturbation with curvature-coupled radius and lr."""
+
+    def __init__(
+        self,
+        params,
+        base_optimizer,
+        rho=0.05,
+        adaptive=False,
+        c=0.1,
+        alpha_min=1e-3,
+        alpha_max=0.2,
+        curvature_ema=0.05,
+        lr_coupling=1.0,
+        power_iter_steps=1,
+        stability_lipschitz=10.0,
+        k_sync=100,
+        gamma_decay=0.95,
+        c_decay=0.95,
+        **kwargs,
+    ):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        assert 0.0 < alpha_min <= alpha_max, "alpha_min must be positive and <= alpha_max"
+        assert 0.0 < curvature_ema <= 1.0, "curvature_ema must be in (0, 1]"
+        assert power_iter_steps >= 1, "power_iter_steps must be >= 1"
+        assert stability_lipschitz > 0.0, "stability_lipschitz must be positive"
+        assert k_sync >= 1, "k_sync must be >= 1"
+
+        defaults = dict(
+            rho=rho,
+            adaptive=adaptive,
+            c=c,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+            curvature_ema=curvature_ema,
+            lr_coupling=lr_coupling,
+            power_iter_steps=power_iter_steps,
+            stability_lipschitz=stability_lipschitz,
+            k_sync=k_sync,
+            gamma_decay=gamma_decay,
+            c_decay=c_decay,
+            **kwargs,
+        )
+        super().__init__(params, defaults)
+
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+        self.defaults.update(self.base_optimizer.defaults)
+
+        for group in self.param_groups:
+            group.setdefault("base_lr", group["lr"])
+
+        self.tau_ema = 0.0
+        self.lambda_ema = 0.0
+        self.last_tau = 0.0
+        self.last_lambda = 0.0
+        self.last_alpha = alpha_min
+        self.last_lr = self.param_groups[0]["lr"]
+        self.global_step = 0
+
+    @torch.no_grad()
+    def _restore_weights(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if "old_p" not in self.state[p]:
+                    continue
+                p.data = self.state[p]["old_p"]
+
+    def step(self, closure=None):
+        assert closure is not None, "CAP requires closure, but it was not provided"
+        closure = torch.enable_grad()(closure)
+
+        params = [
+            p
+            for group in self.param_groups
+            for p in group["params"]
+            if p.requires_grad
+        ]
+        if not params:
+            return None
+
+        self.zero_grad()
+        loss = closure()
+        grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True)
+
+        tau_t, lambda_t = self._estimate_curvature(params, grads)
+        self.last_tau = float(tau_t.detach().item())
+        self.last_lambda = float(lambda_t.detach().item())
+        self._update_curvature_ema(tau_t, lambda_t)
+        alpha_t = self._compute_alpha()
+        lr_t = self._compute_lr(alpha_t)
+        self.last_alpha = alpha_t
+        self.last_lr = lr_t
+
+        self._perturb_weights(grads, alpha_t)
+
+        self.zero_grad()
+        perturbed_loss = closure()
+        perturbed_loss.backward()
+        self._restore_weights()
+
+        for group in self.param_groups:
+            group["lr"] = lr_t
+
+        self.base_optimizer.step()
+        self.zero_grad()
+
+        self.global_step += 1
+        self._sync_hyperparams_if_needed()
+        return loss.detach(), perturbed_loss.detach()
+
+    def _estimate_curvature(self, params, grads):
+        vector = self._rademacher_like(params)
+        hvp_vector = self._hvp(grads, params, vector, retain_graph=True)
+        tau_t = self._dot(vector, hvp_vector).abs()
+
+        q = self._normalize_vector(vector)
+        lambda_t = None
+        for step in range(self.param_groups[0]["power_iter_steps"]):
+            hvp_q = self._hvp(grads, params, q, retain_graph=step + 1 < self.param_groups[0]["power_iter_steps"])
+            lambda_t = self._dot(q, hvp_q).abs()
+            q = self._normalize_vector(hvp_q)
+
+        if lambda_t is None:
+            lambda_t = tau_t
+
+        return tau_t, torch.clamp(lambda_t, min=1e-12)
+
+    def _update_curvature_ema(self, tau_t, lambda_t):
+        gamma = self.param_groups[0]["curvature_ema"]
+        if self.global_step == 0:
+            self.tau_ema = float(tau_t.detach().item())
+            self.lambda_ema = float(lambda_t.detach().item())
+            return
+
+        self.tau_ema = (1.0 - gamma) * self.tau_ema + gamma * float(tau_t.detach().item())
+        self.lambda_ema = (1.0 - gamma) * self.lambda_ema + gamma * float(lambda_t.detach().item())
+
+    def _compute_alpha(self):
+        group = self.param_groups[0]
+        curvature_ratio = self.tau_ema / max(self.lambda_ema, 1e-12)
+        alpha = group["c"] * curvature_ratio
+        alpha = min(max(alpha, group["alpha_min"]), group["alpha_max"])
+
+        max_alpha = 1.0 / max(2.0 * group["stability_lipschitz"] * group["base_lr"], 1e-12)
+        alpha = min(alpha, max_alpha)
+        return float(alpha)
+
+    def _compute_lr(self, alpha_t):
+        group = self.param_groups[0]
+        lr_t = group["base_lr"] / (1.0 + group["lr_coupling"] * alpha_t)
+        max_lr = 1.0 / max(2.0 * group["stability_lipschitz"] * max(alpha_t, 1e-12), 1e-12)
+        return float(min(lr_t, max_lr))
+
+    @torch.no_grad()
+    def _perturb_weights(self, grads, alpha_t):
+        grad_norm = self._grad_norm_from_sequence(grads)
+        grad_index = 0
+        for group in self.param_groups:
+            scale = alpha_t / (grad_norm + 1e-12)
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                grad = grads[grad_index]
+                grad_index += 1
+                self.state[p]["old_p"] = p.data.clone()
+                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * grad.detach() * scale.to(p)
+                p.add_(e_w)
+
+    def _sync_hyperparams_if_needed(self):
+        group = self.param_groups[0]
+        if self.global_step % group["k_sync"] != 0:
+            return
+
+        curvature_ratio = self.tau_ema / max(self.lambda_ema, 1e-12)
+        if curvature_ratio < 0.25:
+            group["c"] = min(group["alpha_max"], group["c"] / max(group["c_decay"], 1e-12))
+        elif curvature_ratio > 1.0:
+            group["c"] *= group["c_decay"]
+
+        if self.lambda_ema > self.tau_ema:
+            group["curvature_ema"] = min(0.5, group["curvature_ema"] / max(group["gamma_decay"], 1e-12))
+        else:
+            group["curvature_ema"] = max(1e-3, group["curvature_ema"] * group["gamma_decay"])
+
+    def _hvp(self, grads, params, vector, retain_graph):
+        hvp = torch.autograd.grad(
+            grads,
+            params,
+            grad_outputs=vector,
+            only_inputs=True,
+            retain_graph=retain_graph,
+            allow_unused=False,
+        )
+        return [h.detach() for h in hvp]
+
+    def _rademacher_like(self, params):
+        return [
+            torch.empty_like(p).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            for p in params
+        ]
+
+    def _normalize_vector(self, vector):
+        norm = torch.sqrt(sum(torch.sum(v * v) for v in vector)).clamp_min(1e-12)
+        return [v / norm for v in vector]
+
+    def _dot(self, left, right):
+        return sum(torch.sum(l * r) for l, r in zip(left, right))
+
+    def _grad_norm_from_sequence(self, grads):
+        shared_device = self.param_groups[0]["params"][0].device
+        return torch.norm(
+            torch.stack([g.detach().norm(p=2).to(shared_device) for g in grads]),
+            p=2,
+        )
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.base_optimizer.param_groups = self.param_groups
